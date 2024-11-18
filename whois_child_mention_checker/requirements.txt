@@ -1,1 +1,3 @@
 openai==0.28.0
+pyyaml==6.0.2
+telethon==1.37.0

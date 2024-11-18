@@ -5,7 +5,9 @@ This script processes a JSON file containing messages to identify and extract de
 ## Requirements
 
 - `openai==0.28.0`
-- Python 3.7 or higher
+- `pyyaml==6.0.2`
+- `telethon==1.37.0`
+- Python 3.12.7
 
 ### Installation
 

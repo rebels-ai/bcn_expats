@@ -1,72 +1,112 @@
 """
-This script processes a JSON file containing messages to identify and extract details
-of senders who mention children (under 18) in messages tagged with the #whois hashtag.
-It utilizes OpenAI's gpt-3.5-turbo model to analyze message content and outputs the results to a text file.
+Telegram Message Analyzer
 
-Requirements:
-- openai==0.28.0 (`openai`) 
-- Python 3.7 or higher
+Author: Sergei Poluektov
+Purpose: Analyzes Telegram messages for mentions of children in messages with #whois hashtag
+Created: 18/11/2024
 
-Environment Variables:
-- OPENAI_API_KEY: Your OpenAI API key.
-
-Usage:
-Ensure the `input_data.json` file is in the same directory or provide the correct path.
-Set the `OPENAI_API_KEY` environment variable before running the script.
-
-Example:
-    export OPENAI_API_KEY='your-api-key-here'
-    python whois_child_mention_checker.py.py
+This script connects to Telegram, fetches messages from a specified chat, and analyzes them
+using OpenAI's GPT-3.5 turbo to identify messages mentioning children. Results are saved to a file
+with sender details and links.
 """
 
-import json
+import asyncio
 import logging
-import os
-from datetime import datetime
-from typing import Dict, List
+from dataclasses import dataclass
+from os import getenv
+from pathlib import Path
+from typing import List, Optional, Set
 
 import openai
+import yaml
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
+from telethon.tl.types import Message, User
 
-
-# Configure logging
+# Configure logging with ISO format timestamp
 logging.basicConfig(
-    filename='script.log',
-    filemode='a',
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    filename="script.log",
+    filemode="a",
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TelegramConfig:
+    """Configuration data structure for Telegram client.
+
+    Attributes:
+        api_id: Telegram API ID
+        api_hash: Telegram API hash
+        session_name: Name of the session file
+        chat_id: ID of the chat to analyze
+        phone_number: Optional phone number for authentication
+    """
+
+    api_id: int
+    api_hash: str
+    session_name: str
+    chat_id: int
+    phone_number: Optional[str] = None
+
+
+def read_config_from_yaml() -> TelegramConfig:
+    """Read configuration data from a YAML file.
+
+    Returns:
+        TelegramConfig: Configuration object with Telegram client settings.
+
+    Raises:
+        FileNotFoundError: If config.yaml doesn't exist
+        yaml.YAMLError: If the YAML file is malformed
+    """
+    try:
+        with Path("config.yaml").open() as file:
+            config_data = yaml.safe_load(file)
+            return TelegramConfig(**config_data)
+    except FileNotFoundError:
+        logger.error("Configuration file 'config.yaml' not found")
+        raise
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML configuration: {e}")
+        raise
 
 
 def get_openai_api_key() -> str:
-    """
-    Retrieve the OpenAI API key from environment variables.
+    """Retrieve the OpenAI API key from environment variables.
 
     Returns:
-        str: OpenAI API key.
+        str: OpenAI API key
 
     Raises:
-        EnvironmentError: If the API key is not found.
+        EnvironmentError: If OPENAI_API_KEY environment variable is not set
     """
-    api_key = os.getenv('OPENAI_API_KEY')
+    api_key = getenv("OPENAI_API_KEY")
     if not api_key:
-        logging.error("OpenAI API key not found in environment variables.")
-        raise EnvironmentError("OpenAI API key not found in environment variables.")
+        logger.error("OpenAI API key not found in environment variables")
+        raise EnvironmentError("OpenAI API key not found in environment variables")
     return api_key
 
 
-def analyze_mentions_of_children(message_text: str, api_key: str) -> bool:
-    """
-    Analyze the given message text to determine if it mentions children under 18.
+async def analyze_mentions_of_children(message_text: str, api_key: str) -> bool:
+    """Analyze if a message mentions children under 18.
 
     Args:
-        message_text (str): The text of the message to analyze.
-        api_key (str): OpenAI API key.
+        message_text: The text message to analyze
+        api_key: OpenAI API key for authentication
 
     Returns:
-        bool: True if the message mentions children under 18, False otherwise.
+        bool: True if the message mentions children, False otherwise
+
+    Note:
+        Uses OpenAI's GPT-3.5 model to analyze Russian text for mentions of children.
     """
     try:
-        response = openai.ChatCompletion.create(
+        response = await openai.ChatCompletion.acreate(
             api_key=api_key,
             model="gpt-3.5-turbo",
             messages=[
@@ -77,148 +117,155 @@ def analyze_mentions_of_children(message_text: str, api_key: str) -> bool:
                 {
                     "role": "user",
                     "content": f"The following message is in Russian: '{message_text}'. "
-                               "If it mentions kids under 18, respond 'yes', otherwise respond 'no'.",
+                    "If it mentions kids under 18, respond 'yes', otherwise respond 'no'.",
                 },
             ],
             max_tokens=5,
             temperature=0.2,
         )
-        result = response.choices[0].message['content'].strip().lower()
-        return result == 'yes'
+        result = response.choices[0].message["content"].strip().lower()
+        return result == "yes"
     except openai.error.OpenAIError as e:
-        logging.error(f"OpenAI API error: {e}")
+        logger.error(f"OpenAI API error: {e}")
         return False
     except Exception as e:
-        logging.error(f"Unexpected error during API call: {e}")
+        logger.error(f"Unexpected error during API call: {e}")
         return False
 
 
-def extract_sender_details_with_children_mentions(
-    json_data: Dict,
-    api_key: str
-) -> List[str]:
-    """
-    Extract sender details from messages that contain the #whois hashtag and mention children.
+async def get_messages(client: TelegramClient, chat_id: int) -> List[Message]:
+    """Fetch messages from the specified Telegram chat.
 
     Args:
-        json_data (dict): The JSON data containing messages.
-        api_key (str): OpenAI API key.
+        client: Authenticated Telegram client
+        chat_id: ID of the chat to fetch messages from
 
     Returns:
-        list: A list of strings with sender names and corresponding timestamps.
+        List[Message]: List of Telegram messages
     """
-    results = []
-    processed_messages = set()  # To avoid processing duplicate messages
+    try:
+        return [msg async for msg in client.iter_messages(chat_id)]
+    except Exception as e:
+        logger.error(f"Error fetching messages from chat {chat_id}: {e}")
+        return []
 
-    for message in json_data.get("messages", []):
+
+def get_user_link(user: User) -> str:
+    """Generate a Telegram user link based on username or ID.
+
+    Args:
+        user: Telegram user object
+
+    Returns:
+        str: URL linking to the user's Telegram profile
+    """
+    return (
+        f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
+    )
+
+
+async def extract_sender_details_with_children_mentions(
+    messages: List[Message], api_key: str
+) -> List[str]:
+    """Extract sender details from messages mentioning children with #whois hashtag.
+
+    Args:
+        messages: List of Telegram messages to analyze
+        api_key: OpenAI API key for content analysis
+
+    Returns:
+        List[str]: Formatted strings with sender details and links
+    """
+    results: List[str] = []
+    processed_messages: Set[str] = set()
+
+    for message in messages:
         try:
-            # Check if the message contains the #whois hashtag
-            if any(
-                entity.get("type") == "hashtag" and entity.get("text").lower() == "#whois"
-                for entity in message.get("text_entities", [])
-            ):
-                # Extract and concatenate message text parts
-                message_text_parts = message.get("text", [])
-                message_text = "".join(
-                    [part["text"] if isinstance(part, dict) else part for part in message_text_parts]
+            if not (message.text and "#whois" in message.text.lower()):
+                continue
+
+            if message.text in processed_messages:
+                logger.info("Duplicate message detected. Skipping analysis.")
+                continue
+
+            processed_messages.add(message.text)
+
+            if await analyze_mentions_of_children(message.text, api_key):
+                sender = await message.get_sender()
+                sender_name = (
+                    f"{sender.first_name or ''} {sender.last_name or ''}".strip()
                 )
+                date = message.date.strftime("%d/%m/%Y %H:%M:%S")
+                user_link = get_user_link(sender)
+                results.append(f"{sender_name} - {date} - {user_link}")
 
-                if not message_text:
-                    logging.warning("Empty message text encountered. Skipping.")
-                    continue
-
-                if message_text in processed_messages:
-                    logging.info("Duplicate message detected. Skipping analysis.")
-                    continue
-
-                processed_messages.add(message_text)
-
-                # Analyze if the message mentions children
-                if analyze_mentions_of_children(message_text, api_key):
-                    sender = message.get("from", "Unknown Sender")
-                    date_str = message.get("date", "")
-                    try:
-                        date = datetime.fromisoformat(date_str)
-                        exact_date_time = date.strftime("%d/%m/%Y %H:%M:%S")
-                    except ValueError as e:
-                        logging.error(f"Date parsing error for date '{date_str}': {e}")
-                        exact_date_time = "Invalid Date"
-
-                    results.append(f"{sender} - {exact_date_time}")
         except Exception as e:
-            logging.error(f"Error processing message: {e}")
+            logger.error(f"Error processing message: {e}")
 
     return results
 
 
-def load_json_data(file_path: str) -> Dict:
-    """
-    Load JSON data from a file.
+async def initialize_client(config: TelegramConfig) -> Optional[TelegramClient]:
+    """Initialize and authenticate the Telegram client.
 
     Args:
-        file_path (str): Path to the JSON file.
+        config: Telegram configuration object
 
     Returns:
-        dict: Parsed JSON data.
+        Optional[TelegramClient]: Authenticated client or None if authentication fails
     """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as input_file:
-            return json.load(input_file)
-    except FileNotFoundError:
-        logging.error(f"File not found: {file_path}")
-        return {}
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON decode error in file {file_path}: {e}")
-        return {}
-    except Exception as e:
-        logging.error(f"Unexpected error loading JSON data: {e}")
-        return {}
+    client = TelegramClient(config.session_name, config.api_id, config.api_hash)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        if not config.phone_number:
+            logger.error(
+                "Client is not authorized and no phone number provided in config"
+            )
+            return None
+
+        try:
+            await client.send_code_request(config.phone_number)
+            code = input("Enter the code you received: ")
+            await client.sign_in(config.phone_number, code)
+        except SessionPasswordNeededError:
+            password = input(
+                "Two-step verification enabled. Please enter your password: "
+            )
+            await client.sign_in(password=password)
+        except Exception as e:
+            logger.error(f"Authentication failed: {e}")
+            return None
+
+    return client
 
 
-def write_results_to_file(results: List[str], file_path: str) -> None:
-    """
-    Write the results to a text file.
-
-    Args:
-        results (list): List of result strings to write.
-        file_path (str): Path to the output text file.
-    """
-    try:
-        with open(file_path, "w", encoding='utf-8') as output_file:
-            output_file.write("\n".join(results))
-        logging.info(f"Results successfully written to {file_path}.")
-    except IOError as e:
-        logging.error(f"I/O error writing to file {file_path}: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error writing to file {file_path}: {e}")
-
-
-def main():
-    """
-    Main function to manage the processing of messages.
-    """
-    input_file_path = 'input_data.json'
-    output_file_path = 'output_results.txt'
-
-    logging.info("Script started.")
+async def main() -> None:
+    """Main execution function."""
+    logger.info("Script started")
 
     try:
+        config = read_config_from_yaml()
         api_key = get_openai_api_key()
-    except EnvironmentError as e:
-        logging.critical(f"API key error: {e}")
-        return
 
-    json_data = load_json_data(input_file_path)
-    if not json_data:
-        logging.error("No data to process. Exiting script.")
-        return
+        client = await initialize_client(config)
+        if not client:
+            return
 
-    results = extract_sender_details_with_children_mentions(json_data, api_key)
+        messages = await get_messages(client, config.chat_id)
+        results = await extract_sender_details_with_children_mentions(messages, api_key)
 
-    write_results_to_file(results, output_file_path)
+        output_path = Path("output_results.txt")
+        output_path.write_text("\n".join(results), encoding="utf-8")
+        logger.info(f"Results successfully written to {output_path}")
 
-    logging.info("Script finished successfully.")
+    except Exception as e:
+        logger.error(f"Script execution failed: {e}")
+    finally:
+        if "client" in locals() and client:
+            await client.disconnect()
+            logger.info("Script finished successfully")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
